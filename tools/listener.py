@@ -21,11 +21,54 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # ── 配置 ─────────────────────────────────────────────
 BOT_QQ = 3941207947
-GROUP_ID = 1015096890
+GROUP_IDS = [1015096890, 771979831]  # 唯爱豆包 + 测试群
 NAPCAT_WS = "ws://127.0.0.1:3001"
 NAPCAT_HTTP = "http://127.0.0.1:3000"
 
+# ── 群聊上下文 ──────────────────────────────────────
+_chat_buffers = {}   # {group_id: [(nick, msg), ...]}
+_last_speak = {}     # {group_id: (timestamp, topic)}
+BUFFER_SIZE = 20
 
+
+def update_buffer(gid: int, nick: str, msg: str):
+    if gid not in _chat_buffers:
+        _chat_buffers[gid] = []
+    _chat_buffers[gid].append((nick, msg))
+    if len(_chat_buffers[gid]) > BUFFER_SIZE:
+        _chat_buffers[gid] = _chat_buffers[gid][-BUFFER_SIZE:]
+
+
+def buffer_context(gid: int) -> str:
+    msgs = _chat_buffers.get(gid, [])
+    return "\n".join([f"{n}: {m}" for n, m in msgs[-10:]])
+
+
+def can_chime_in(gid: int, current_topic: str) -> bool:
+    """基于话题判断是否允许插话。新话题可立即插，同话题需冷却。"""
+    if gid not in _last_speak:
+        return True
+    last_time, last_topic = _last_speak[gid]
+    now = time.time()
+    # 换了话题 → 允许
+    if current_topic != last_topic:
+        return True
+    # 同一话题 → 至少隔 60 秒
+    return (now - last_time) > 60
+
+
+def extract_topic(msg: str) -> str:
+    """从消息中提取话题关键词"""
+    topics = ["地科", "地理", "竞赛", "高考", "中科大", "南大", "吉大", "985",
+              "邓紫棋", "孙燕姿", "演唱会", "旅游", "出国", "苏北", "老家",
+              "生病", "姐姐", "保研", "化学", "物理", "暖宝宝", "俄罗斯", "新加坡"]
+    for t in topics:
+        if t in msg:
+            return t
+    return msg[:10]  # 无关键词则取前 10 个字作为话题唯一标识
+
+
+# ── 系统提示词 ──────────────────────────────────────
 def load_system_prompt():
     prompt_file = ROOT / "prompts" / "generate.md"
     with open(prompt_file, "r", encoding="utf-8") as f:
@@ -34,21 +77,22 @@ def load_system_prompt():
 
 SYSTEM_PROMPT = load_system_prompt()
 SYSTEM_PROMPT += """
-## 群聊回复规则
 
-你现在在 QQ 群"唯爱豆包"里和大家聊天。群友 @你 就是在跟你说话。
-- 用短说说风格回复（1-3句话，口语化）
-- 被认真提问时才用长文风格
-- 可以调侃自己，但不要自怨自艾超过两句
+## 群聊场景 · 两种参与方式
 
-## 动态更新回复规则（重要）
+### @你（必须回复）
+有人 @你 就是在跟你说话。按回答协议处理。
 
-如果群友问你"有新说说吗""最近发没发动态""空间更新了没"之类的问题：
-1. 立即回复"我去看看..."之类的话，表示你正在检查
-2. 系统会自动拉取最新说说，然后告诉你结果
-3. 如果系统告诉你没有新内容，就回复"最近没发什么诶"之类
-4. 如果系统告诉你有新内容，就简短总结（1-2句）聊一下最近发了什么
+### 围观插话（自行判断）
+你一直看着群聊。当话题撞到你的领域——地理、地科、竞赛、高考、邓紫棋、孙燕姿、吉大、985、苏北、出国——你可以主动插一句，像真人一样在合适的时机说话。
+
+插话规则：
+- 说一句就走，不要连续占屏
+- 如果话题已经过了，就别硬接
+- 对你不在乎的话题保持沉默
+- 如果系统提示你"插话检测"但你不该说话，回复 SILENT
 """
+
 
 
 # ── LLM 配置 ──────────────────────────────────────────
@@ -101,10 +145,11 @@ def call_llm(user_message: str, context: str = "") -> str:
 
 
 # ── 回复发送 ──────────────────────────────────────────
-def send_reply(text: str):
+def send_reply(text: str, group_id: int = 0):
+    gid = group_id or GROUP_IDS[0]
     resp = requests.post(
         f"{NAPCAT_HTTP}/send_group_msg",
-        json={"group_id": GROUP_ID, "message": text},
+        json={"group_id": gid, "message": text},
         timeout=10,
     )
     if resp.json().get("retcode") == 0:
@@ -251,67 +296,73 @@ def on_message(ws, raw):
         return
     if event.get("message_type") != "group":
         return
-    if event.get("group_id") != GROUP_ID:
+    gid = event.get("group_id", 0)
+    if gid not in GROUP_IDS:
         return
 
     raw_msg = event.get("raw_message", "")
-    if not parse_at_me(raw_msg, event):
-        return
-
     sender_nick = event.get("sender", {}).get("nickname", "?")
-    clean_msg = clean_message(raw_msg)
     sender_qq = event.get("user_id", "")
+    clean_msg = clean_message(raw_msg)
 
-    print(f"\n[listener] @from {sender_nick}({sender_qq}): {clean_msg}")
+    # 存入上下文缓冲
+    update_buffer(gid, sender_nick, clean_msg)
 
-    # 检查是否在问动态更新
-    if is_check_update_request(clean_msg):
-        print("[listener] -> 检测到更新请求，采集QZone...")
-
-        result = {"new_count": 0, "new_posts": []}
-
-        def do_collect():
-            nonlocal result
-            result = collect_new_posts()
-
-        t = threading.Thread(target=do_collect)
-        t.start()
-        t.join(timeout=120)
-
-        # 用 LLM 生成自然回复
-        summary_ctx = generate_update_summary(result)
-        if summary_ctx:
-            if summary_ctx == "NO_NEW_CONTENT":
-                # 让 LLM 自由发挥说没更新
-                reply = call_llm("群友问我最近有没有发新说说，但实际没有新内容。用我的语气回一句，简短自然。", f"发送者: {sender_nick}")
-            else:
-                reply = call_llm(summary_ctx)
-
-        if not reply:
-            # 兜底：黄子洋口吻
-            if result["new_count"] == 0:
-                reply = "最近没发啥诶 太懒了🥱"
-            else:
-                reply = f"刚看了一下 最近发了{result['new_count']}条 自己去看吧 懒得总结了哈哈"
-        send_reply(reply)
+    # 忽略 bot 自己的消息
+    if sender_qq == BOT_QQ:
         return
 
-    # 普通 @ 回复
-    context = f"发送者: {sender_nick}\n消息: {clean_msg}"
-    reply = call_llm(clean_msg, context)
-    if not reply:
-        # 兜底：黄子洋口吻
-        fallbacks = [
-            "在呢 刚下课🥱",
-            "干嘛 又生病了躺着呢",
-            "哈哈 咋了",
-            "忙着呢 在看地理的东西",
-            "啥事 说",
-            "刚睡醒 这体质真是没谁了",
-            "在想今天吃啥 饿了",
-        ]
-        reply = random.choice(fallbacks)
-    send_reply(reply)
+    # ── 被 @ 了 → 必须回复 ──
+    if parse_at_me(raw_msg, event):
+        print(f"\n[listener] @from {sender_nick}: {clean_msg}")
+
+        if is_check_update_request(clean_msg):
+            print("[listener] -> 更新请求，采集QZone...")
+            result = {"new_count": 0, "new_posts": []}
+            def do_collect():
+                nonlocal result
+                result = collect_new_posts()
+            t = threading.Thread(target=do_collect)
+            t.start()
+            t.join(timeout=120)
+            summary_ctx = generate_update_summary(result)
+            if summary_ctx:
+                if summary_ctx == "NO_NEW_CONTENT":
+                    reply = call_llm("群友问我最近有没有发新说说，但实际没有新内容。用我的语气回一句。", f"发送者: {sender_nick}")
+                else:
+                    reply = call_llm(summary_ctx)
+            if not reply:
+                reply = f"最近发了{result['new_count']}条 自己去看吧 懒得总结了" if result["new_count"] else "最近没发啥诶 太懒了🥱"
+            send_reply(reply, gid)
+            _last_speak[gid] = (time.time(), extract_topic(clean_msg))
+            return
+
+        reply = call_llm(clean_msg, f"发送者: {sender_nick}")
+        if not reply:
+            fallbacks = ["在呢 刚下课🥱", "干嘛 又生病了躺着呢", "哈哈 咋了", "啥事 说"]
+            reply = random.choice(fallbacks)
+        send_reply(reply, gid)
+        _last_speak[gid] = (time.time(), extract_topic(clean_msg))
+        return
+
+    # ── 围观模式：判断是否值得插话 ──
+    if not can_chime_in(gid, extract_topic(clean_msg)):
+        return
+
+    ctx = buffer_context(gid)
+    prompt = f"""群聊里大家在聊天，最后一条是【{sender_nick}: {clean_msg}】。
+最近对话：
+{ctx}
+
+作为黄子洋，你现在想插一句嘴吗？
+- 如果话题正好撞到你的领域（地理/地科/竞赛/高考/邓紫棋/孙燕姿/吉大/985/苏北/出国/旅游/演唱会/生病），插一句——短，自然，像真人聊天。
+- 如果话题无关或者已经过了，回复 SILENT。"""
+
+    reply = call_llm(prompt)
+    if reply and reply.strip().upper() != "SILENT":
+        print(f"\n[listener] chime-in [{sender_nick}说'{clean_msg[:30]}']: {reply[:60]}")
+        send_reply(reply, gid)
+        _last_speak[gid] = (time.time(), extract_topic(clean_msg))
 
 
 def on_error(ws, error):
@@ -327,7 +378,7 @@ def on_open(ws):
 
 
 def main():
-    print(f"[listener] Bot QQ: {BOT_QQ}, Group: {GROUP_ID}")
+    print(f"[listener] Bot QQ: {BOT_QQ}, Groups: {GROUP_IDS}")
     print(f"[listener] connecting to {NAPCAT_WS}...")
 
     ws = websocket.WebSocketApp(
