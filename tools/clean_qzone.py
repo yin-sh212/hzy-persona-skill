@@ -12,6 +12,22 @@ sys.path.insert(0, str(ROOT))
 from tools.classifier import classify
 
 
+def is_noise(text: str) -> bool:
+    """判断是否是低质量噪声内容"""
+    # 去掉数字、日期、标点后还剩多少有效中文字符
+    chinese = re.sub(r'[\d\s\W_，。！？、；：“”""''（）\(\)\[\]【】…—\-\·]', '', text)
+    # 去掉常见元数据词
+    chinese = re.sub(r'赞|评论|转发|举报|来自|客户端|查看全部|张照片|我也说一句|展开查看全文', '', chinese)
+    if len(chinese) < 8:
+        return True
+    # 纯地名+日期组合（如"嘉峪关2017年8月5日"）
+    pure_meta = re.sub(r'[\w一-鿿]*\d{4}年\d{1,2}月\d{1,2}日', '', chinese)
+    pure_meta = re.sub(r'赞|评论|举报|来自|客户端', '', pure_meta)
+    if len(pure_meta.strip()) < 4:
+        return True
+    return False
+
+
 def clean_content(raw: str) -> dict:
     """清洗单条说说原始文本，返回结构化数据"""
     text = raw.strip()
@@ -101,6 +117,11 @@ def main():
 
         if not body or len(body) < 5:
             print(f"  [{i+1}] 跳过（空内容）")
+            continue
+
+        # 质量过滤：纯元数据/无实质性内容的帖子
+        if is_noise(body):
+            print(f"  [{i+1}] 跳过（噪声）: {body[:40]}...")
             continue
 
         # 分类
