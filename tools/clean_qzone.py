@@ -17,7 +17,10 @@ def clean_content(raw: str) -> dict:
     text = raw.strip()
 
     # 1. 去掉昵称前缀
-    text = re.sub(r'^烟霭载月~\s*', '', text)
+    if text.startswith("烟霭载月"):
+        text = re.sub(r'^烟霭载月~\s*', '', text)
+    if text.startswith("南街东巷"):
+        text = re.sub(r'^南街东巷\s*', '', text)
 
     # 2. 提取日期
     date_match = re.search(
@@ -76,7 +79,10 @@ def clean_content(raw: str) -> dict:
 
 
 def main():
-    input_file = ROOT / "raw" / f"qzone_1318846394.json"
+    if len(sys.argv) > 1:
+        input_file = Path(sys.argv[1])
+    else:
+        input_file = ROOT / "raw" / "qzone_1318846394.json"
     if not input_file.exists():
         print(f"文件不存在: {input_file}")
         sys.exit(1)

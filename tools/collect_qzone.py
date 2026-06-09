@@ -123,23 +123,46 @@ def collect(uin: str, max_pages: int = 50):
 
             print(f"[collect]   本页新增 {new_count}，累计 {len(all_data)}")
 
-            # 翻页
+            # 翻页 - 多策略尝试
             next_clicked = False
-            for next_text in ["下一页", "下页", "»"]:
+
+            # 策略1: 找"下一页"链接
+            for sel in [
+                "a:has-text('下一页')",
+                "a:has-text('下页')",
+                "a:has-text('»')",
+                "[class*='next']:not(.disabled)",
+                "a[class*='next']",
+            ]:
                 try:
-                    btn = page.locator(f"a:text-is('{next_text}')").first
-                    if btn.is_visible():
+                    btn = page.locator(sel).first
+                    if btn.count() > 0 and btn.is_visible():
                         btn.click()
                         next_clicked = True
                         break
                 except:
                     continue
 
+            # 策略2: 找分页组件中的页码链接，点最后一个
             if not next_clicked:
-                # 尝试滚动到底部触发加载
+                try:
+                    page_links = page.locator(".mod_pagenav a, .pager a, [class*='page'] a")
+                    if page_links.count() > 0:
+                        page_links.last.click()
+                        next_clicked = True
+                except:
+                    pass
+
+            # 策略3: 滚动到底部触发懒加载
+            if not next_clicked:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(3000)
-                # 检查是否有新元素
+
+            if next_clicked:
+                page.wait_for_timeout(3000)
+            else:
+                # 最终检查：内容是否有变化
+                page.wait_for_timeout(2000)
                 new_items = page.locator(best_sel).all()
                 if len(new_items) <= len(items):
                     print("[collect] 无更多内容")
